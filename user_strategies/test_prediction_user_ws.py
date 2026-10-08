@@ -196,6 +196,23 @@ def predict_receipt(*, fee=Decimal("0.2"), trade_id="settlement", state=Settleme
 
 
 class PredictUserWSTest(unittest.IsolatedAsyncioTestCase):
+    async def test_rejection_reason_logged_without_provider_secrets(self):
+        for reason in ("noMarketMatch", "rejectedDuplicate", "rejectedPostOnly", "private-wallet-jwt", None):
+            with self.subTest(reason=reason):
+                feed = self.feed()
+                payload = {"type": "orderNotAccepted", "orderHash": "pf-order", "timestamp": 1000,
+                           "reason": reason, "signature": "private-signature",
+                           "details": {"marketId": 1, "outcome": "NO", "quoteType": "BID",
+                                       "quantity": "10", "quantityFilled": "0", "price": "0.4", "strategyType": "MARKET"}}
+                events = feed.stream.handle({"topic": "predictWalletEvents/private-wallet-jwt", "data": payload})
+                with self.assertLogs("prediction-check", level="WARNING") as logs:
+                    feed.observe(events[0])
+                text = " ".join(logs.output)
+                expected = reason if reason in ("noMarketMatch", "rejectedDuplicate", "rejectedPostOnly") else "UNKNOWN" if reason else "NOT_PROVIDED"
+                self.assertIn("reason=" + expected, text)
+                self.assertNotIn("private-wallet-jwt", text)
+                self.assertNotIn("private-signature", text)
+
     def feed(self, updated=None):
         trading = SimpleNamespace(credentials=SimpleNamespace(api_key="fixture"), jwt=AsyncMock(return_value="private-wallet-jwt"))
         feed = PredictFunUserObserver(trading, updated)

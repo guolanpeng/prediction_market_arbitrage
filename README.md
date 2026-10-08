@@ -9,6 +9,17 @@
 
 从本仓库根目录运行，需要 uv 与 Python 3.13：
 
+Windows 使用下面的安装命令；Ubuntu 24.04 x86_64 的安装、私有数据切换和运行步骤见
+[Ubuntu 迁移说明](UBUNTU.md)。两种平台使用同一个依赖锁，虚拟环境各自重新创建。
+
+Windows 本机可用下面的脚本上传当前代码并在 Ubuntu 服务器安装。
+先复制 `deploy.example.json` 为 `deploy.local.json`，填写 user、host、port 和 remote_directory。
+本地配置被 Git 忽略，不进入上传包。已有服务器 `.env` 和交易日记账不覆盖，不自动启动实盘：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\upload_deploy.ps1
+```
+
 ```powershell
 cd D:\WorkSpace\prediction_market_arbitrage
 uv sync --project python --locked --group test --no-build
@@ -60,6 +71,14 @@ Redis 的 `prediction:v1` 键和 JSON 字段保持不变，现有控制面板可
 
 ## 切换旧项目的实盘状态
 
+行情检查、模拟、实盘和 Redis 扫描启动后，日志同时输出到终端和本仓库的
+`logs/prediction/`，按启动日期命名为 `check-YYYY-MM-DD.log`、
+`paper-YYYY-MM-DD.log`、`live-YYYY-MM-DD.log` 或 `scan-YYYY-MM-DD.log`。
+再次启动时追加，不覆盖已有日志。`CHECK` 行保留毛价差、费用、盘口成本和时间戳，
+可以用于分布分析。已经运行的进程需要在妥善处理未决订单后重启，才会启用文件日志。
+模拟记录仍写入 `data/prediction/paper/`，实盘日记账仍写入
+`data/prediction/live/orders.jsonl`；日志和运行数据均被 Git 忽略。
+
 本仓库迁移的是源代码、文档、测试及依赖，不含旧 `.env`、日志、市场目录或交易日记账。
 原项目 `D:\WorkSpace\arbitrage_app` 中的文件仍保留。
 
@@ -75,6 +94,7 @@ uv run --project python --no-sync --env-file .env python -m user_strategies.chec
 ```
 
 当前门槛是预计扣费、扣份与缓冲后的每组差价 > $1，两边可用余额 ≥ $15，
+Predict.fun 允许 1% 滑点，额外预算计入上述开仓门槛及余额、授权检查；目标份数不增加。
 最后 60 秒不新开仓，同一窗口最多尝试一次。Polymarket 按现金预算买入，
 实际份数会变化；Predict.fun 使用目标份数与预算约束。两边超过 0.5 份差额时
 尝试退出多余部分，再等待正式结算。当前退出仍是一次 IOC 尝试，未增加分批持续退出。

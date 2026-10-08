@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 import synpath
-from synpath.trading.types import SettlementState
+from synpath.trading.types import SettlementState, OrderStatus
 from websockets.asyncio.client import connect
 
 LOG = logging.getLogger("prediction-check")
@@ -101,6 +101,12 @@ class UserOrderObserver:
             self.times.setdefault(order.id, {}).setdefault("ws_first_order_at_ms", event.received_at)
             LOG.info("USER_WS_ORDER venue=%s order_id=%s status=%s filled=%s received_at_ms=%s",
                      self.venue, order.id, order.status, order.filled, event.received_at)
+            if self.venue == "predict_fun" and order.status in (OrderStatus.REJECTED, OrderStatus.CANCELED):
+                reason = order.info.get("reason")
+                # Emit only documented codes, never a provider body, JWT or arbitrary error string.
+                safe_reason = reason if reason in ("noMarketMatch", "rejectedDuplicate", "rejectedPostOnly", "selfTradePrevention") else "UNKNOWN" if reason else "NOT_PROVIDED"
+                LOG.warning("USER_WS_ORDER_REJECTED venue=%s order_id=%s status=%s reason=%s received_at_ms=%s",
+                            self.venue, order.id, order.status, safe_reason, event.received_at)
         elif isinstance(event, synpath.FillEvent):
             fill = event.fill
             if fill.market_id not in self.markets:

@@ -164,7 +164,7 @@ class ExecutionTest(unittest.IsolatedAsyncioTestCase):
                 index = trader.adapters.index(adapter)
                 arrived[index].set()
                 await arrived[1 - index].wait()
-                self.assertEqual(plan["cash_budget"], Decimal(3) if index == 0 else Decimal(4))
+                self.assertEqual(plan["cash_budget"], Decimal(3) if index == 0 else Decimal("4.04"))
                 self.assertEqual(plan["target_shares"], Decimal(10))
                 before(str(index), plan["cash_budget"], Decimal(1))
                 return SimpleNamespace(id=str(index), venue=plan["venue"], market_id=plan["market_id"],
@@ -176,12 +176,51 @@ class ExecutionTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(LiveSettlementPending):
                     await asyncio.wait_for(trader.execute(window, candidate, Decimal(10), lambda i, s: []), 2)
             self.assertEqual(trader.rows[0]["execution"], "CONCURRENT_CASH_MARKET")
-            self.assertEqual({r["leg"]:r["cash_budget"] for r in trader.rows if r["type"]=="CASH_SUBMIT_INTENT"}, {0:Decimal(3), 1:Decimal(4)})
+            self.assertEqual({r["leg"]:r["cash_budget"] for r in trader.rows if r["type"]=="CASH_SUBMIT_INTENT"}, {0:Decimal(3), 1:Decimal("4.04")})
             for adapter in trader.adapters:
                 adapter.cancel_order.assert_not_called()
             with self.assertRaises(LiveTradeHalt):
                 await trader.execute(window, candidate, Decimal(10), lambda i, s: [])
             self.assertFalse(any(row["type"] == "DONE" for row in trader.rows))
+
+    async def test_reported_budget_overrun_continues_pair_or_single_leg_handling(self):
+        for paired in (True, False):
+            with self.subTest(paired=paired), tempfile.TemporaryDirectory() as directory:
+                trader, window, candidate = self.fixtures(directory)
+                trader.max_trades = 2
+                trader.send_cash = AsyncMock(side_effect=[SimpleNamespace(id="poly"), SimpleNamespace(id="predict")])
+                size = Decimal("15.357143")
+                other_size = size if paired else Decimal(0)
+                trader.wait_fills = AsyncMock(return_value=[size, other_size])
+                trader.inventories["poly"] = {"gross_shares": size, "net_shares": size,
+                                               "share_fees": Decimal(0), "cash_value": Decimal("3.05"),
+                                               "cash_fee": Decimal(0)}
+                trader.inventories["predict"] = {"gross_shares": other_size, "net_shares": other_size,
+                                                  "share_fees": Decimal(0), "cash_value": Decimal(4) if paired else Decimal(0),
+                                                  "cash_fee": Decimal(0)}
+                trader.confirmed = AsyncMock(return_value=Decimal("15.35"))
+                with self.assertRaises(LiveSettlementPending):
+                    await trader.execute(window, candidate, Decimal(10), lambda i, s: asks(("0.2", "100")))
+                warning = next(row for row in trader.rows if row["type"] == "BUDGET_OVERRUN")
+                self.assertEqual(warning["actual"], Decimal("3.05"))
+                self.assertEqual(warning["budget"], Decimal(3))
+                self.assertEqual(warning["excess"], Decimal("0.05"))
+                self.assertFalse(any(row["type"] == "HALT" for row in trader.rows))
+                self.assertEqual(trader.rows[-1]["state"], "PAIRED" if paired else "UNBALANCED_ENTRY")
+                self.assertEqual(trader.rows[-1]["entry_cash_values"][0], Decimal("3.05"))
+                if paired:
+                    trader.send.assert_not_awaited()
+                else:
+                    request = trader.send.await_args.args[1]
+                    self.assertEqual(request.amount, Decimal("15.35"))
+                    self.assertTrue(request.reduce_only)
+                    self.assertTrue(trader.rows[-1]["stop_after"])
+                    self.assertEqual(trader.rows[-1]["remaining_net_shares"], [Decimal("0.007143"), Decimal(0)])
+                with self.assertRaises(LiveTradeHalt):
+                    await trader.execute({**window, "start": window["start"] + 300}, candidate, Decimal(10), lambda i, s: [])
+                self.assertEqual(trader.send_cash.await_count, 2)
+                resumed = LiveTrader(trader.path)
+                self.assertEqual(len(resumed.settlement_waiting), 1)
 
     async def test_unknown_fill_enters_read_only_confirmation_without_blind_unwind(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -221,6 +260,77 @@ class ExecutionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await trader.execute(window, candidate, Decimal(10), lambda i, s: []), "LIMIT_EDGE_NOT_ELIGIBLE")
             for adapter in trader.adapters:
                 adapter.create_order.assert_not_called()
+
+    async def test_predict_slippage_cost_rejects_edge_before_any_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trader, window, candidate = self.fixtures(directory)
+            candidate["asks"] = [asks(("0.51", "10")), asks(("0.35", "10"))]
+            candidate["result"] = calculate(*candidate["asks"], Decimal(10), candidate["configs"])
+            # Before the extra 0.035 USDT, this snapshot clears the final $1 gate.
+            fee = Decimal("0.2")
+            before_slippage = Decimal(10) - fee - Decimal("8.60") - candidate["result"]["legs"][0]["fee"] - Decimal("0.02")
+            self.assertGreater(before_slippage, Decimal(1))
+            trader.send_cash = AsyncMock()
+            self.assertEqual(await trader.execute(window, candidate, Decimal(10), lambda i, s: []), "LIMIT_EDGE_NOT_ELIGIBLE")
+            trader.send_cash.assert_not_awaited()
+            self.assertEqual(trader.rows, [])
+
+    async def test_predict_multilevel_plan_and_signature_match_official_sdk(self):
+        from predict_sdk import OrderBuilder
+        from predict_sdk.constants import ChainId, Side
+        from predict_sdk.types import Book, MarketHelperInput
+        from synpath.trading.polymarket_signing import WalletSigner
+        from synpath.trading.predict_fun import MarketInfo
+        from synpath.trading.predict_fun_signing import MAINNET
+        from user_strategies.prediction_cash_orders import predict_payload
+        with tempfile.TemporaryDirectory() as directory:
+            trader, window, candidate = self.fixtures(directory)
+            candidate["asks"][1] = asks(("0.63", "5"), ("0.66", "5"))
+            candidate["result"] = calculate(*candidate["asks"], Decimal(10), candidate["configs"])
+            plan = (await trader.cash_buy_plans(window, candidate, Decimal(10)))[1]
+            official = OrderBuilder.make(ChainId.BNB_MAINNET).get_market_order_amounts(
+                MarketHelperInput(side=Side.BUY, quantity_wei=10 * 10**18, slippage_bps=100),
+                Book(market_id=2, update_timestamp_ms=1, asks=[(0.63, 5), (0.66, 5)], bids=[]))
+            signer = WalletSigner("0x" + "1" * 64)
+            info = MarketInfo(native="2", yes_token="1", no_token="2", neg_risk=False, yield_bearing=False, fee_rate_bps=200)
+            body, _ = predict_payload(plan, info, signer, signer.address, MAINNET, None, now_s=1, salt=1)
+            data = body["data"]
+            self.assertEqual(plan["quoted_cash_budget"], Decimal("6.45"))
+            self.assertEqual(plan["cash_budget"], Decimal("6.666"))
+            self.assertEqual(plan["worst_price"], Decimal("0.66"))
+            self.assertEqual(int(data["order"]["makerAmount"]), official.maker_amount)
+            self.assertEqual(int(data["order"]["takerAmount"]), official.taker_amount)
+            self.assertEqual(int(data["pricePerShare"]), official.price_per_share)
+            self.assertEqual(int(data["slippageBps"]), official.slippage_bps)
+            self.assertEqual(data["order"]["tokenId"], "2")
+
+    async def test_worst_tier_budget_rejects_average_cost_edge_without_orders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trader, window, candidate = self.fixtures(directory)
+            candidate["asks"] = [asks(("0.40", "10")), asks(("0.40", "5"), ("0.50", "5"))]
+            candidate["result"] = calculate(*candidate["asks"], Decimal(10), candidate["configs"])
+            before = Decimal("9.8") - Decimal(4) - Decimal("4.5") * Decimal("1.01") - candidate["result"]["legs"][0]["fee"] - Decimal("0.02")
+            self.assertGreater(before, Decimal(1))
+            trader.send_cash = AsyncMock()
+            trader.wait_fills = AsyncMock(return_value=[Decimal(0), Decimal(0)])
+            trader.max_trades = 2
+            self.assertEqual(await trader.execute(window, candidate, Decimal(10), lambda i, s: []), "LIMIT_EDGE_NOT_ELIGIBLE")
+            trader.send_cash.assert_not_awaited()
+            self.assertEqual(trader.rows, [])
+
+    async def test_predict_slippage_reserves_cash_without_projecting_extra_shares(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trader, window, candidate = self.fixtures(directory)
+            trader.send_cash = AsyncMock(side_effect=[SimpleNamespace(id="poly"), SimpleNamespace(id="predict")])
+            trader.wait_fills = AsyncMock(return_value=[Decimal(10), Decimal(10)])
+            trader.check_balances = AsyncMock()
+            with self.assertRaises(LiveSettlementPending):
+                await trader.execute(window, candidate, Decimal(10), lambda i, s: [])
+            intent = next(row for row in trader.rows if row["type"] == "INTENT")
+            self.assertEqual(intent["estimated_received_shares"][1], Decimal("9.8"))
+            self.assertEqual(intent["reserved"][1], Decimal("4.1308"))
+            trader.check_balances.assert_awaited_once_with(intent["reserved"])
+            trader.check_predict_buy_approval.assert_awaited_once_with(window, Decimal("4.1308"))
 
     async def test_unwind_uses_net_receipt_and_onchain_balance_not_gross_ten(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -386,7 +496,9 @@ class ExecutionTest(unittest.IsolatedAsyncioTestCase):
             trader, window, candidate = self.fixtures(directory)
             trader.adapters[0].token_info.return_value.tick = Decimal("0.001")
             plans = await trader.cash_buy_plans(window, candidate, Decimal(10))
-            self.assertEqual([plan["cash_budget"] for plan in plans], [Decimal(3), Decimal(4)])
+            self.assertEqual([plan["cash_budget"] for plan in plans], [Decimal(3), Decimal("4.04")])
+            self.assertEqual(plans[1]["quoted_cash_budget"], Decimal(4))
+            self.assertEqual(plans[1]["slippage_bps"], 100)
             trader.adapters[0].token_info.assert_awaited_with("123", refresh=True)
             candidate["ticks"][1] = None
             self.assertEqual(await trader.execute(window, candidate, Decimal(10), lambda i, s: []), "MARKET_CONSTRAINTS_NOT_VERIFIED")

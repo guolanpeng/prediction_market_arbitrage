@@ -135,12 +135,26 @@ Risk rules:
 Both buys are **concurrent MARKET orders**, not GTC then cancel.
 Polymarket uses cash-budget FAK; Predict.fun uses quantity-based MARKET without
 fill-or-kill. Budgets bind principal spend, while fees may be extra cash or
-deducted shares. Polymarket retains its broad legal price boundary. Predict signs
-the target shares directly, with `isMinAmountOut=false` and `pricePerShare` equal
-to the signed cash/share ratio. A $3.20 budget for 10 shares therefore bounds the
-price at $0.32: a better price can fill 10 for less cash, a worse price may not fill.
-On multiple price levels, the average-cost budget may not buy the full requested
-size; the runner never increases it to the worst-tier cost. ORDER records label
+deducted shares. A confirmed receipt cash value above the signed budget records
+`BUDGET_OVERRUN` and a warning, then continues position handling rather than
+stopping before an excess-share exit. Unbalanced fills still trigger the existing
+exit attempt, stop new entries and wait for resolution; unknown fills or exits
+retain their confirmation/reconciliation protections.
+Polymarket retains its broad legal price boundary. Predict signs
+the target shares directly, with `isMinAmountOut=false` and `slippageBps=100` (1%).
+`pricePerShare` retains the quoted average price. The locked official Python SDK
+calculates the signed cash budget from the worst consumed ask tier times the
+target shares, increased once by 1%. Decimal book levels are passed directly;
+the SDK converts to integer wei without a float conversion. A single-tier $3.20 cost for 10 shares
+therefore signs a $3.232 cash limit and a $0.32 reference price, allowing up to
+$0.3232 per share. The target shares are unchanged. Funds and allowance checks
+reserve against the increased budget, and the final >$1 entry gate deducts the
+full slippage budget without projecting extra shares. Plans record
+`quoted_cash_budget`, `cash_budget`, `worst_price` and `slippage_bps`.
+For example, five shares at $0.63 and five at $0.66 quote $6.45 but sign
+$6.666 (10 * $0.66 * 1.01), with a $0.645 reference price. The full $6.666
+budget is checked against balances, approvals and the entry gate. Prices outside
+that signed ratio can still cause partial or no fill. ORDER records label
 Polymarket's signed minimum and Predict's signed target separately; actual counts
 still come from confirmed fills. This correction is tested against the official
 quantity-based SDK helper and mocked POST payloads; no real order was sent to
@@ -243,6 +257,10 @@ the HTTP status when preserved by the SDK, for both entry and unwind orders.
 Examples include FAK_NO_MATCH, INVALID_SIGNATURE, ALLOWANCE and BALANCE.
 Unknown provider errors remain UNCLASSIFIED; no raw text/body is logged and a
 missing historical response cannot be reconstructed from a generic OrderRejected.
+Predict.fun asynchronous order rejection/cancellation events also log
+`USER_WS_ORDER_REJECTED` with the documented `noMarketMatch`, `rejectedDuplicate`,
+`rejectedPostOnly` or `selfTradePrevention` code. Missing codes are NOT_PROVIDED;
+unknown codes are UNKNOWN. Arbitrary provider text, JWTs and signatures are not logged.
 This diagnostic change does not retry or resubmit a failed order. Already-running
 processes use the old code until their next start.
 An exclusive OS file lock prevents two processes using the same live journal.

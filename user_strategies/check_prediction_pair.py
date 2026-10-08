@@ -7,9 +7,11 @@ import logging
 import math
 import os
 import time
+import traceback
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, localcontext
+from pathlib import Path
 
 import httpx
 import synpath
@@ -217,6 +219,11 @@ async def auto_btc(args, discover=discover_btc_window, check=None):
             except (LiveTradeHalt, LiveRunComplete, LiveSettlementPending, LiveConfirmationPending):
                 raise
             except Exception as error:
+                # SDK error messages may contain credentials; record only types and frame locations.
+                LOG.error("AUTO_CHECK_FAILED error_type=%s context_type=%s frames=%s",
+                          type(error).__name__, type(error.__context__).__name__ if error.__context__ else None,
+                          [(Path(frame.filename).name, frame.lineno, frame.name)
+                           for frame in traceback.extract_tb(error.__traceback__)])
                 trader = getattr(args, "live_trader", None)
                 if trader is not None and trader.pending:
                     raise LiveTradeHalt("Live execution/cleanup failed after order submission; do not reconnect") from None
@@ -318,9 +325,13 @@ async def run(args, window_end=None):
                 delay = args.interval if window_end is None else min(args.interval, max(0, window_end - time.time()))
                 await asyncio.sleep(delay)
         finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                # Keep consuming frames through close: the SDK queues its final marker with put_nowait.
+                await stack.aclose()
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def paper_btc(args):
@@ -421,7 +432,13 @@ def main():
         parser.error("--polymarket, --predictfun and positive --quantity are required")
     if not args.list and not args.auto_btc and not all(value.isdigit() for value in (args.polymarket, args.predictfun)):
         parser.error("Market IDs must be numeric")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log_dir = Path(__file__).resolve().parents[1] / "logs" / "prediction"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    mode = "live" if args.live else "paper" if args.paper else "check"
+    log_path = log_dir / f"{mode}-{datetime.now():%Y-%m-%d}.log"
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        handlers=[logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8")])
+    LOG.info("LOG_FILE %s", log_path)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         if args.list:

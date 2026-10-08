@@ -11,6 +11,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP, localcontext
 from itertools import combinations
+from pathlib import Path
 
 import httpx
 from redis.asyncio import Redis
@@ -460,7 +461,12 @@ def main() -> None:
     if (min(args.interval, args.discovery_interval, args.ttl, args.max_age) < 1 or args.max_markets < 0
             or not args.quantity.is_finite() or args.quantity <= 0):
         parser.error("Intervals/TTL/quantity must be positive and max-markets nonnegative")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log_dir = Path(__file__).resolve().parents[1] / "logs" / "prediction"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"scan-{datetime.now():%Y-%m-%d}.log"
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        handlers=[logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8")])
+    LOG.info("LOG_FILE %s", log_path)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         asyncio.run(run(args))

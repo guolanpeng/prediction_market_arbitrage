@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from user_strategies.check_prediction_pair import auto_btc, live_btc, calculate, decimal, fee_config, validate_btc_window
+from user_strategies.check_prediction_pair import auto_btc, live_btc, run, calculate, decimal, fee_config, validate_btc_window
 
 
 def asks(*pairs):
@@ -98,6 +98,87 @@ class WindowTest(unittest.TestCase):
 
 
 class RolloverTest(unittest.IsolatedAsyncioTestCase):
+    async def test_quote_shutdown_keeps_readers_alive_until_streams_close(self):
+        from synpath.ws.base import Stream
+        from user_strategies.prediction_trading import LiveSettlementPending, LiveConfirmationPending
+
+        for signal in (LiveSettlementPending, LiveConfirmationPending, asyncio.CancelledError):
+            with self.subTest(signal=signal.__name__):
+                streams = []
+
+                class QuoteStream(Stream):
+                    def __init__(self, **kwargs):
+                        super().__init__("unused", max_queue=kwargs["max_queue"])
+                        self.closed = False
+                        self._ws = SimpleNamespace(close=self.close_socket)
+                        streams.append(self)
+
+                    def start(self):
+                        self.connected.set()
+                        return self
+
+                    async def watch_order_book(self, ids):
+                        pass
+
+                    def book(self, market_id, side):
+                        return SimpleNamespace(ready=True, timestamp=601000,
+                                               levels=lambda: ([], asks(("0.25", "100"))))
+
+                    async def close_socket(self):
+                        # Frames can arrive while the WebSocket close handshake is pending.
+                        for _ in range(self._queue.maxsize):
+                            self._queue.put_nowait(object())
+                        await asyncio.sleep(0)
+                        self.closed = True
+
+                record = {"attempt": "entry"}
+                trader = SimpleNamespace(pending=True, balance_checked_at=float("inf"),
+                                         execute=AsyncMock(side_effect=signal(record)))
+                args = argparse.Namespace(seconds=0, interval=2, quantity=Decimal(10),
+                                          polymarket_side="yes", predictfun_side="no", auto_btc=True,
+                                          live_trader=trader)
+                market = SimpleNamespace(info={}, id="1", yes=SimpleNamespace(label="Up"),
+                                         no=SimpleNamespace(label="Down"), title="BTC", active=True,
+                                         close_datetime=None, close_timestamp=None, tick_size="0.01")
+                config = {"model": "quadratic_theta", "rate": Decimal(0), "places": "0.00001"}
+                def discover(start):
+                    return {"polymarket": "1", "predictfun": "2", "end": 900,
+                            "polymarket_rule": None, "predictfun_rule": None}
+                with patch.dict("os.environ", {"PREDICT_FUN_API_KEY": "fixture"}), \
+                        patch("user_strategies.check_prediction_pair.time.time", return_value=601), \
+                        patch("user_strategies.check_prediction_pair.load_market", return_value=(market, config)), \
+                        patch("user_strategies.check_prediction_pair.synpath.PolymarketMarketStream", QuoteStream), \
+                        patch("user_strategies.check_prediction_pair.synpath.PredictFunMarketStream", QuoteStream), \
+                        patch("user_strategies.check_prediction_pair.live_entry_reason", return_value=None):
+                    with self.assertRaises(signal):
+                        await auto_btc(args, discover, run)
+                trader.execute.assert_awaited_once()
+                self.assertEqual(len(streams), 2)
+                self.assertTrue(all(stream.closed for stream in streams))
+
+    async def test_unexpected_live_failure_logs_locations_without_error_contents(self):
+        from user_strategies.prediction_trading import LiveTradeHalt
+        args = argparse.Namespace(seconds=0, live_trader=SimpleNamespace(pending=True))
+        def discover(start):
+            return {"polymarket": "1", "predictfun": "2", "end": 900,
+                    "polymarket_rule": None, "predictfun_rule": None}
+        async def check(config, window_end):
+            try:
+                raise ValueError("private-token-must-not-be-logged")
+            except ValueError:
+                raise RuntimeError("authenticated-url-must-not-be-logged")
+        with patch.dict("os.environ", {"PREDICT_FUN_API_KEY": "fixture"}), \
+                patch("user_strategies.check_prediction_pair.time.time", return_value=601), \
+                self.assertLogs("prediction-check", level="ERROR") as captured:
+            with self.assertRaises(LiveTradeHalt):
+                await auto_btc(args, discover, check)
+        output = "\n".join(captured.output)
+        self.assertIn("error_type=RuntimeError", output)
+        self.assertIn("context_type=ValueError", output)
+        self.assertIn("test_check_prediction_pair.py", output)
+        self.assertNotIn("private-token", output)
+        self.assertNotIn("authenticated-url", output)
+
     async def test_confirmation_timeout_switches_to_queries_then_settlement_without_rescanning(self):
         from user_strategies.prediction_trading import LiveConfirmationPending, LiveRunComplete
         record = {"attempt": "delayed"}

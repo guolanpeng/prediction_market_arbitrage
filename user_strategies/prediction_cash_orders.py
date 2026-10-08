@@ -7,6 +7,8 @@ from synpath.trading import polymarket_signing as poly
 from synpath.trading import predict_fun_signing as predict
 from synpath.trading.types import Order, OrderType, OrderStatus, Side, TimeInForce
 
+PREDICT_SLIPPAGE_BPS = 100
+
 
 def cash_budget(value, venue):
     value = Decimal(str(value))
@@ -40,12 +42,13 @@ def predict_payload(plan, info, signer, maker, network, account, now_s=None, sal
     with localcontext() as context:
         context.prec = 100
         budget = cash_budget(plan["cash_budget"], "predict_fun")
+        quoted_budget = cash_budget(plan["quoted_cash_budget"], "predict_fun")
         maker_amount = int(budget * 10**18)
         target = Decimal(str(plan["target_shares"]))
         if not target.is_finite() or target <= 0:
             raise ValueError("Invalid Predict target shares")
         shares = predict.significant(int(target * 10**18), 5)
-        if budget < 1 or shares < predict.MIN_SHARES_WEI:
+        if quoted_budget < 1 or shares < predict.MIN_SHARES_WEI:
             raise ValueError("Predict market buy needs at least 1 USDT")
         if maker_amount >= shares:
             raise ValueError("Predict cash budget per share must be below $1")
@@ -59,9 +62,9 @@ def predict_payload(plan, info, signer, maker, network, account, now_s=None, sal
                     hash=order_hash, signature=signature)
         # Use the standard quantity-based MARKET path: takerAmount is actual shares.
         # The signed cash/share ratio also caps spend, without deflating the target.
-        expected_price = maker_amount * 10**18 // shares
+        expected_price = predict.to_wei(plan["expected_price"])
         return {"data": {"order": wire, "strategy": "MARKET", "pricePerShare": str(expected_price),
-                          "slippageBps": "0", "isMinAmountOut": False}}, order_hash
+                          "slippageBps": str(PREDICT_SLIPPAGE_BPS), "isMinAmountOut": False}}, order_hash
 
 
 async def submit_cash_buy(adapter, plan, before_submit):
@@ -98,7 +101,7 @@ async def submit_cash_buy(adapter, plan, before_submit):
         acknowledged = str((raw or {}).get("data", {}).get("orderHash") or order_id)
         status = OrderStatus.PENDING
     semantics = "SIGNED_MINIMUM_SHARES" if plan["venue"] == "polymarket" else "SIGNED_TARGET_SHARES"
-    price = Decimal(1) - plan["tick"] if plan["venue"] == "polymarket" else Decimal(body["data"]["pricePerShare"]) / 10**18
+    price = Decimal(1) - plan["tick"] if plan["venue"] == "polymarket" else Decimal(body["data"]["order"]["makerAmount"]) / Decimal(body["data"]["order"]["takerAmount"])
     return Order(id=acknowledged, market_id=plan["market_id"], venue=plan["venue"],
                  side=Side.BUY if plan["outcome"] == "yes" else Side.SELL, type=OrderType.MARKET,
                  time_in_force=TimeInForce.IOC, status=status, amount=minimum,

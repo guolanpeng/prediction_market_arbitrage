@@ -542,7 +542,11 @@ class LiveTrader:
         return Decimal(int(raw, 16)) / Decimal(10) ** decimals
 
     async def cash_buy_plans(self, window, candidate, quantity):
-        from user_strategies.prediction_cash_orders import cash_budget
+        from user_strategies.prediction_cash_orders import cash_budget, PREDICT_SLIPPAGE_BPS
+        from predict_sdk import OrderBuilder
+        from predict_sdk.constants import ChainId, Side as PredictSide
+        from predict_sdk.types import Book, MarketHelperInput
+        from synpath.trading.predict_fun_signing import significant, to_wei, from_wei
         tokens = await self.adapters[0].market_tokens(f"polymarket:{window['polymarket']}")
         info = await self.adapters[0].token_info(tokens.token(candidate["sides"][0]), refresh=True)
         ticks = [Decimal(str(info.tick)), candidate["ticks"][1]]
@@ -553,10 +557,31 @@ class LiveTrader:
             budget = cash_budget(candidate["result"]["legs"][index]["cost"], venue)
             if budget < 1:
                 raise ValueError("Market buy budget below venue minimum")
+            quoted_budget = budget
+            expected_price = candidate["result"]["legs"][index]["cost"] / quantity
+            if index == 1:
+                with localcontext() as context:
+                    context.prec = 100
+                    # Pass Decimal levels; the SDK converts via Decimal(str(value)), without floats.
+                    book = Book(market_id=int(window["predictfun"]), update_timestamp_ms=int(candidate["timestamps"][1]),
+                                asks=[(level.price, level.size) for level in candidate["asks"][1]
+                                      if 0 < level.price < 1 and level.size > 0], bids=[])
+                    amounts = OrderBuilder.make(ChainId.BNB_MAINNET).get_market_order_amounts(
+                        MarketHelperInput(side=PredictSide.BUY, quantity_wei=to_wei(quantity),
+                                          slippage_bps=PREDICT_SLIPPAGE_BPS, is_min_amount_out=False), book)
+                    if amounts.amount != significant(to_wei(quantity), 5):
+                        raise ValueError("Insufficient Predict depth for target shares")
+                    budget = from_wei(amounts.maker_amount)
+                    expected_price = from_wei(amounts.price_per_share)
+                    worst_price = from_wei(amounts.last_price)
+                if budget >= from_wei(amounts.taker_amount):
+                    raise ValueError("Predict slippage budget per share must be below $1")
             plans.append({"venue": venue, "market_id": f"{venue}:{window['polymarket' if index == 0 else 'predictfun']}",
                           "outcome": candidate["sides"][index], "target_shares": quantity,
-                          "cash_budget": budget, "expected_price": candidate["result"]["legs"][index]["cost"] / quantity,
+                          "cash_budget": budget, "expected_price": expected_price,
                           "tick": ticks[index]})
+            if index == 1:
+                plans[-1].update(quoted_cash_budget=quoted_budget, worst_price=worst_price, slippage_bps=PREDICT_SLIPPAGE_BPS)
         return plans
 
     async def execute(self, window, candidate, quantity, bids):
@@ -577,11 +602,13 @@ class LiveTrader:
         except ValueError:
             return "MARKET_CONSTRAINTS_NOT_VERIFIED"
         reserved = [plan["cash_budget"] * (1 + config["rate"]) + Decimal("0.01") for plan, config in zip(plans, candidate["configs"])]
-        predict_gross = quantity * plans[1]["cash_budget"] / quoted["legs"][1]["cost"]
+        # Slippage increases the cash limit, not the signed target share quantity.
+        from synpath.trading.predict_fun_signing import significant, to_wei, from_wei
+        predict_gross = from_wei(significant(to_wei(quantity), 5))
         predict_share_fee = estimated_share_fee(candidate["asks"][1], predict_gross, candidate["configs"][1])
         projected = [quantity * plans[0]["cash_budget"] / quoted["legs"][0]["cost"], predict_gross - predict_share_fee]
         minimum_payout = min(projected)
-        conservative_net = minimum_payout - sum(leg["cost"] for leg in quoted["legs"]) - quoted["legs"][0]["fee"] - Decimal("0.02")
+        conservative_net = minimum_payout - sum(plan["cash_budget"] for plan in plans) - quoted["legs"][0]["fee"] - Decimal("0.02")
         if conservative_net <= MIN_NET_TOTAL:
             return "LIMIT_EDGE_NOT_ELIGIBLE"
         await self.check_balances(reserved)
@@ -642,8 +669,11 @@ class LiveTrader:
             raise LiveConfirmationPending(record)
         for index, inventory in enumerate(inventory_rows):
             if inventory and inventory.get("cash_value") is not None and inventory["cash_value"] > plans[index]["cash_budget"] + Decimal("0.000001"):
-                self.write("HALT", attempt, reason="CASH_BUDGET_EXCEEDED", leg=index, actual=inventory["cash_value"], budget=plans[index]["cash_budget"])
-                raise LiveTradeHalt("Confirmed cash value exceeds the signed budget; review required")
+                excess = inventory["cash_value"] - plans[index]["cash_budget"]
+                self.write("BUDGET_OVERRUN", attempt, leg=index, actual=inventory["cash_value"],
+                           budget=plans[index]["cash_budget"], excess=excess)
+                LOG.warning("CASH_BUDGET_EXCEEDED leg=%s actual=%s budget=%s excess=%s continue_position_handling=true",
+                            index, inventory["cash_value"], plans[index]["cash_budget"], excess)
         financial_entries = [row or ({"cash_value": Decimal(0), "cash_fee": Decimal(0)} if size == 0 else {})
                              for row, size in zip(inventory_rows, sizes)]
         if net_sizes == [Decimal(0), Decimal(0)]:

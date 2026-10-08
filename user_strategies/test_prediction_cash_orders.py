@@ -30,14 +30,16 @@ class CashPayloadTest(unittest.TestCase):
             self.assertTrue(order_id.startswith("0x"))
 
     def test_predict_signs_cash_budget_and_market_without_fill_or_kill(self):
+        self.plan.update(quoted_cash_budget=Decimal("1.70"), cash_budget=Decimal("1.717"))
         info = MarketInfo(native="123", yes_token="1", no_token="2", neg_risk=False, yield_bearing=False, fee_rate_bps=200)
         body, order_id = predict_payload(self.plan, info, self.signer, self.signer.address, MAINNET, None, now_s=1, salt=1)
         self.assertEqual(body["data"]["strategy"], "MARKET")
-        self.assertEqual(body["data"]["order"]["makerAmount"], "1700000000000000000")
+        self.assertEqual(body["data"]["order"]["makerAmount"], "1717000000000000000")
         self.assertEqual(body["data"]["order"]["tokenId"], "2")
         self.assertFalse(body["data"]["isMinAmountOut"])
         self.assertEqual(body["data"]["pricePerShare"], "170000000000000000")
-        self.assertEqual(Decimal(body["data"]["order"]["makerAmount"]) / Decimal(body["data"]["pricePerShare"]), Decimal(10))
+        self.assertEqual(body["data"]["slippageBps"], "100")
+        self.assertEqual(Decimal(body["data"]["order"]["makerAmount"]) / Decimal(body["data"]["order"]["takerAmount"]), Decimal("0.1717"))
         self.assertNotIn("isFillOrKill", body["data"])
         self.assertEqual(int(body["data"]["order"]["takerAmount"]), 10 * 10**18)
         self.assertTrue(order_id.startswith("0x"))
@@ -47,27 +49,28 @@ class CashPayloadTest(unittest.TestCase):
         from predict_sdk.constants import ChainId, Side
         from predict_sdk.types import Book, MarketHelperInput
 
-        self.plan.update(cash_budget=Decimal("3.20"), expected_price=Decimal("0.32"))
+        self.plan.update(quoted_cash_budget=Decimal("3.20"), cash_budget=Decimal("3.232"), expected_price=Decimal("0.32"))
         info = MarketInfo(native="123", yes_token="1", no_token="2", neg_risk=False, yield_bearing=False, fee_rate_bps=200)
         body, _ = predict_payload(self.plan, info, self.signer, self.signer.address, MAINNET, None, now_s=1, salt=1)
         data = body["data"]
         official = OrderBuilder.make(ChainId.BNB_MAINNET).get_market_order_amounts(
-            MarketHelperInput(side=Side.BUY, quantity_wei=10 * 10**18),
+            MarketHelperInput(side=Side.BUY, quantity_wei=10 * 10**18, slippage_bps=100),
             Book(market_id=123, update_timestamp_ms=1, asks=[(0.32, 100)], bids=[]))
         self.assertEqual(int(data["order"]["makerAmount"]), official.maker_amount)
         self.assertEqual(int(data["order"]["takerAmount"]), official.taker_amount)
         self.assertEqual(int(data["pricePerShare"]), official.price_per_share)
         self.assertEqual(data["isMinAmountOut"], official.is_min_amount_out)
+        self.assertEqual(int(data["slippageBps"]), official.slippage_bps)
         self.assertEqual(Decimal(data["order"]["takerAmount"]) / 10**18, Decimal(10))
         # At the observed improved price, ten shares cost $2.80, within the $3.20 budget.
         self.assertLessEqual(Decimal(10) * Decimal("0.28"), Decimal(data["order"]["makerAmount"]) / 10**18)
 
     def test_predict_share_precision_rounds_down_and_budget_does_not_inflate(self):
-        self.plan.update(target_shares=Decimal("10.000123"), cash_budget=Decimal("3.20"))
+        self.plan.update(target_shares=Decimal("10.000123"), quoted_cash_budget=Decimal("3.20"), cash_budget=Decimal("3.232"), expected_price=Decimal("0.32"))
         info = MarketInfo(native="123", yes_token="1", no_token="2", neg_risk=False, yield_bearing=False, fee_rate_bps=200)
         body, _ = predict_payload(self.plan, info, self.signer, self.signer.address, MAINNET, None, now_s=1, salt=1)
         self.assertEqual(body["data"]["order"]["takerAmount"], str(10 * 10**18))
-        self.assertEqual(body["data"]["order"]["makerAmount"], str(3200000000000000000))
+        self.assertEqual(body["data"]["order"]["makerAmount"], str(3232000000000000000))
         for target in ("NaN", "Infinity", "0", "-1"):
             self.plan["target_shares"] = Decimal(target)
             with self.assertRaises(ValueError):
@@ -96,19 +99,21 @@ class PredictSubmissionTest(unittest.IsolatedAsyncioTestCase):
                                   _call=AsyncMock(return_value={"success": True, "data": {}}))
         for outcome, token in (("yes", "1"), ("no", "2")):
             plan = {"venue": "predict_fun", "market_id": "predict_fun:123", "outcome": outcome,
-                    "target_shares": Decimal(10), "cash_budget": Decimal("3.20"),
+                    "target_shares": Decimal(10), "quoted_cash_budget": Decimal("3.20"), "cash_budget": Decimal("3.232"),
                     "expected_price": Decimal("0.32"), "tick": Decimal("0.01")}
             recorded = []
             order = await submit_cash_buy(adapter, plan, lambda *args: recorded.append(args))
             data = adapter._call.call_args.kwargs["body"]["data"]
             self.assertEqual(adapter._call.call_args.args, ("POST", "/orders"))
             self.assertEqual(data["order"]["takerAmount"], str(10 * 10**18))
-            self.assertEqual(data["order"]["makerAmount"], str(3200000000000000000))
+            self.assertEqual(data["order"]["makerAmount"], str(3232000000000000000))
+            self.assertEqual(data["slippageBps"], "100")
+            self.assertEqual(data["pricePerShare"], "320000000000000000")
             self.assertEqual(data["order"]["tokenId"], token)
             self.assertFalse(data["isMinAmountOut"])
             self.assertEqual(data["strategy"], "MARKET")
             self.assertNotIn("isFillOrKill", data)
-            self.assertEqual(recorded[0][1:], (Decimal("3.20"), Decimal(10)))
+            self.assertEqual(recorded[0][1:], (Decimal("3.232"), Decimal(10)))
             self.assertEqual(order.amount, Decimal(10))
             self.assertEqual(order.info["amount_semantics"], "SIGNED_TARGET_SHARES")
-            self.assertEqual(order.price, Decimal("0.32") if outcome == "yes" else Decimal("0.68"))
+            self.assertEqual(order.price, Decimal("0.3232") if outcome == "yes" else Decimal("0.6768"))
