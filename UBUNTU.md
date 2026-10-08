@@ -1,5 +1,16 @@
 # Ubuntu 24.04 x86_64 迁移
 
+本页原流程为 Python 部署。Rust 版本可在本机 WSL Ubuntu 22.04 编译完成后上传
+已构建的 Linux 程序，服务器不需要 Rust 编译器：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\upload_rust.ps1 -BuildOnly
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\upload_rust.ps1
+```
+
+第二条会上传和安装，不启动实盘。详细配置、22.04/24.04 兼容性检查与数据保护
+见 [Rust BTC 上传说明](RUST_BTC.md)。
+
 从项目根目录运行。使用 uv 管理的 `python/.venv`，Python 3.13；不需要
 NautilusTrader、Rust 编译工具或交易引擎。依赖支持 Windows 和 Linux，版本由
 `python/uv.lock` 锁定。发布包同时包含 uv 导出的带哈希 `python/requirements.txt`。

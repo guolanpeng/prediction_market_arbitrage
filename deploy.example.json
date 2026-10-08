@@ -2,5 +2,6 @@
   "user": "your_user",
   "host": "your_server_ip",
   "port": 22,
-  "remote_directory": "/home/your_user/prediction_market_arbitrage"
+  "remote_directory": "/home/your_user/prediction_market_arbitrage",
+  "wsl_distribution": "Ubuntu-22.04"
 }

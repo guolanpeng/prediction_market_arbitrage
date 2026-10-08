@@ -44,8 +44,61 @@ Release 性能配置为 `opt-level=3`、Fat LTO、`codegen-units=1`，关闭增�
 `Cargo.lock` 锁定 Rust 依赖及 registry 包校验和。`target/`、二进制和运行数据被 Git
 忽略。Python `python/uv.lock` 和带哈希的导出 requirements 保持原样。
 离线构建需预先准备已锁定的 Cargo 依赖，使用 `cargo build --release --locked --offline`。
-现有 Python 发布、安装和部署脚本仍只处理 Python，不会自动发布 Rust 二进制。
-没有制作发布包，没有在仓库中包含凭证。
+原有 Python 上传脚本仍只处理 Python；下面的 Rust 上传流程独立使用 WSL 构建。
+发布包和编译产物均在 Git 忽略目录，不包含运行凭证。
+
+## 在 WSL Ubuntu 22.04 编译并上传到 Ubuntu 24.04
+
+Windows 运行 `scripts/upload_rust.ps1`。先在本机 WSL `Ubuntu-22.04` 构建
+`x86_64-unknown-linux-gnu` release 程序、运行 Rust 测试，再打包并上传；服务器
+只安装已编译程序，不编译 Rust，不安装 Python 交易依赖，也不会启动实盘。
+两边均要求 x86_64。编译使用通用 x86-64 指令集，不绑定本机 CPU。
+
+WSL 必须已有 Rust/rustup、GCC、CMake、Python 3、binutils 和 util-linux；例如系统
+编译工具可由管理员用 `sudo apt-get install build-essential cmake binutils python3 util-linux`
+安装。Rust 按仓库 `rust-toolchain.toml` 使用 1.98.1，首次联网构建可能下载这个锁定
+工具链及 Cargo 依赖。若已安装的命名工具链或 `stable` 恰好是要求的 1.98.1，
+脚本直接复用，不重复下载；`stable` 是其他版本时不会绕过版本锁定。
+编译缓存放在 WSL 的 Linux 文件系统中，源码使用一份干净
+快照，不复制 Windows 的 `target/` 或虚拟环境。
+
+先只构建，不连接服务器：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\upload_rust.ps1 -BuildOnly
+```
+
+只构建成功会生成 `dist/prediction-market-rust-ubuntu22-to24-x86_64.tar.gz` 和
+对应 `.sha256`。包内包括 Linux 程序、Rust/Python 锁定依赖说明、源码、文档及
+逐文件 `SHA256SUMS`；不包含 `.env`、`deploy.local.json`、日志、日记账和 `.venv`。
+所有构建和测试完成后才会执行 SSH/SCP。
+
+复用现有 `deploy.local.json` 的 `user`、`host`、`port`、`remote_directory`；可以
+增加可选 `wsl_distribution`，默认是 `Ubuntu-22.04`。然后执行上传与安装：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\upload_rust.ps1
+```
+
+命令行 `-Server user@host`、`-Port`、`-RemoteDirectory`、`-ConfigFile` 和
+`-WslDistribution` 可覆盖配置。`-Jobs 4` 控制本地编译并发；依赖与工具链已缓存
+时可加 `-Offline`，构建仍强制 `--locked`。
+
+Ubuntu 22.04 的 glibc 基线是 2.35，24.04 是 2.39。打包时检查 ELF 架构、实际
+glibc 符号需求不得高于 2.35，以及只依赖常见系统运行库，并在 WSL 执行 `--help`
+和离线计算。远端验证归档及每个文件的哈希、动态库可用性，再执行同样的离线
+检查；检查失败不替换运行程序。版本差异由实际 ELF 检查和远端启动测试兜底，
+不依赖“系统版本更新就必定兼容”的假设。
+
+服务器需要 Bash、Python 3 标准库、tar、flock、ldd 和正常的系统证书。
+脚本不会自动安装服务器系统工具。已有 `.env`、未决日记账、日志和虚拟环境
+不覆盖。日记账锁或本机账户锁被占用时拒绝更新；旧程序保存在
+`dist/rust-backups/`，新程序最后以原子替换方式安装到
+`target/release/prediction-market`。服务器已有 Python 环境时，原模块路径的
+`--backend rust` 也能找到它。
+
+上传脚本不迁移账户私有数据。跨主机切换前必须停止原实盘进程，完整迁移未决
+日记账，并另行安全配置服务器 `.env`；程序安装成功不代表已验证真实成交。
 
 ## 运行
 
