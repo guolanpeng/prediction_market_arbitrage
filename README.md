@@ -7,6 +7,10 @@
 
 ## 安装
 
+BTC 五分钟配对链路新增独立 Rust 实现，Polymarket 使用官方 Rust SDK；
+Predict.fun 原生签名与官方 SDK 做离线对照。范围、构建、兼容入口与恢复说明见
+[Rust BTC 实盘迁移](RUST_BTC.md)。现有 Python 入口仍为默认，不会自动切换实盘。
+
 从本仓库根目录运行，需要 uv 与 Python 3.13：
 
 Windows 使用下面的安装命令；Ubuntu 24.04 x86_64 的安装、私有数据切换和运行步骤见

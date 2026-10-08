@@ -390,6 +390,8 @@ async def live_btc(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=("python", "rust"), default="python",
+                        help="Use the standalone Rust runner for automatic BTC checks/live trading")
     parser.add_argument("--list", action="store_true", help="List current source candidates and their market IDs")
     parser.add_argument("--auto-btc", action="store_true", help="Discover and roll over the current BTC five-minute window")
     parser.add_argument("--paper", action="store_true", help="Record one simulated pair per BTC window and official settlements")
@@ -407,6 +409,12 @@ def main():
     parser.add_argument("--interval", type=float, default=2, help="Log interval; WS updates are continuous")
     parser.add_argument("--seconds", type=float, default=0, help="Stop after this many seconds; 0 runs until Ctrl+C")
     args = parser.parse_args()
+    if args.backend == "rust":
+        from user_strategies.prediction_rust import btc
+        try:
+            raise SystemExit(btc(args))
+        except ValueError as error:
+            parser.error(str(error))
     if args.trade_credentials:
         print(json.dumps(credentials_status()))
         return

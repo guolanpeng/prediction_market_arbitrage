@@ -13,4 +13,5 @@ data/
 *.log
 *.whl
 dist/
+target/
 deploy.local.json

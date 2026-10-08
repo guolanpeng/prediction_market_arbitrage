@@ -1,0 +1,49 @@
+[package]
+name = "prediction-market-arbitrage"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Standalone BTC five-minute paired prediction-market trading"
+
+[lib]
+name = "prediction_market"
+path = "rust/lib.rs"
+
+[[bin]]
+name = "prediction-market"
+path = "rust/main.rs"
+
+[dependencies]
+anyhow = "=1.0.104"
+bigdecimal = "=0.4.10"
+chrono = "=0.4.45"
+clap = { version = "=4.6.7", features = ["derive"] }
+dotenvy = "=0.15.7"
+num-bigint = "=0.4.8"
+num-traits = "=0.2.19"
+reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151", features = ["arbitrary_precision", "preserve_order"] }
+log = { version = "=0.4.34", features = ["std"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "time", "sync", "signal", "io-util", "io-std"] }
+alloy-primitives = "=1.7.3"
+alloy-sol-types = "=1.7.3"
+k256 = { version = "=0.13.4", features = ["ecdsa"] }
+base64 = "=0.22.1"
+uuid = { version = "=1.26.1", features = ["v4"] }
+futures-util = "=0.3.34"
+tokio-tungstenite = { version = "=0.30.0", features = ["rustls-tls-webpki-roots"] }
+rustls = "=0.23.45"
+polymarket_client_sdk_v2 = { version = "=0.8.0", features = ["clob", "ws"] }
+
+# Highest runtime optimization. Preserve arithmetic checks and stack unwinding
+# for the live runner; journal/account-lock cleanup remains unchanged.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+incremental = false
+debug = false
+strip = "debuginfo"
+overflow-checks = true
+panic = "unwind"

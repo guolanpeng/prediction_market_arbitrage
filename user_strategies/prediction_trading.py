@@ -236,6 +236,15 @@ class LiveTrader:
         # Never emit SDK HTTP bodies, signatures, authenticated URLs or credential objects.
         logging.getLogger("synpath").setLevel(logging.CRITICAL)
         try:
+            from eth_account import Account as EvmAccount
+            from user_strategies.prediction_account_lock import account_locks
+            try:
+                self.stack.enter_context(account_locks([
+                    ("polymarket", poly.funder if signature_type else EvmAccount.from_key(poly.private_key).address),
+                    ("predict_fun", predict.account_address or EvmAccount.from_key(predict.private_key).address),
+                ]))
+            except OSError:
+                raise LiveTradeHalt("Another process uses a live account on this host") from None
             lock = self.stack.enter_context(self.path.with_suffix(".lock").open("a+b"))
             if lock.seek(0, 2) == 0:
                 lock.write(b"0")
